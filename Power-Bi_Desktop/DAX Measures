@@ -1,8 +1,5 @@
-DeltaT = AVERAGE(Fact_TestSummary[DeltaT_SS])
-
-// pressure drop across the cold plate only
-dP_ColdPlate = AVERAGE(Fact_TestSummary[dP_ColdPlate_SS])
-
+// Note: simple measures that just average a single column (e.g. Rth, Tj, Tin, Power) are not included here as they are straightforward AVERAGE() calls on Fact_TestSummary.
+// Only measures with actual logic or formatting are listed below.
 // core temp minus average coolant temp, shows how hard the cold plate is working
 dT_Cores_Max = 
 AVERAGE(Fact_TestSummary[TCores_Max_SS]) 
