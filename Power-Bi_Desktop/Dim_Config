@@ -1,0 +1,58 @@
+let
+    // ValidFrom = when this config kicked in, ValidTo = null if it's still the active one
+    Source = Table.FromRecords({
+        [
+            Config_ID              = 1,
+            ValidFrom              = #date(2026, 1, 1),
+            ValidTo                = null,
+            Protocol_Version       = "v3.0",
+            Cp_Water               = 4186.0,      // 
+            Water_Density_kg_m3    = 998.0,        // 
+            Bucket_Width_s         = 2,            // how wide each LabVIEW time bucket 
+            Sync_Tolerance_s       = 1,            // max offset for a "Good" sync between LV and HWiNFO
+            SS_Window_Rows         = 15,           // rolling window for steady-state check (approx 60s)
+            SS_Threshold           = 0.01,         // if Rth std dev is below this, we call it steady-state
+            Anomaly_Temp_Min_C     = -1000,        // anything outside this range gets flagged
+            Anomaly_Temp_Max_C     = 1000,
+            SS_Gap_Max_Rows        = 6,            // biggest gap allowed to bridge inside one SS block
+            SS_Min_Block_Rows      = 150,          // minium amount of rows to count as a valid SS block (5 min)
+            NoMatch_Max_Rows       = 10,           // limit of unmatched rows 
+            PoorSync_Max_Rows      = 6,            // limit of poor-quality syncs
+            Glycol_Pct             = 0,            // percentage of glycol
+            TIM                    = "Nexalus Hydronex",
+
+            // sensor uncertainties
+            TC_Accuracy_C          = 0.2,          // thermocouple accuracy +- 0.2 degrees 
+            FlowMeter_Accuracy_Pct = 3.0,          // +-3% of reading
+            Power_Accuracy_Pct     = 5.0,          // HWiNFO package power +-5%
+            Pressure_Accuracy_kPa  = 0.22,         // diff pressure sensor +-0.22 kPa
+            Notes                  = "Initial V3 configuration"
+        ]
+    }),
+    Typed = Table.TransformColumnTypes(Source, {
+        {"Config_ID",              Int64.Type},
+        {"ValidFrom",              type date},
+        {"ValidTo",                type date},
+        {"Protocol_Version",       type text},
+        {"Cp_Water",               type number},
+        {"Water_Density_kg_m3",    type number},
+        {"Bucket_Width_s",         Int64.Type},
+        {"Sync_Tolerance_s",       Int64.Type},
+        {"SS_Window_Rows",         Int64.Type},
+        {"SS_Threshold",           type number},
+        {"Anomaly_Temp_Min_C",     type number},
+        {"Anomaly_Temp_Max_C",     type number},
+        {"SS_Gap_Max_Rows",        Int64.Type},
+        {"SS_Min_Block_Rows",      Int64.Type},
+        {"NoMatch_Max_Rows",       Int64.Type},
+        {"PoorSync_Max_Rows",      Int64.Type},
+        {"Glycol_Pct",             type number},
+        {"TIM",                    type text},
+        {"TC_Accuracy_C",          type number},
+        {"FlowMeter_Accuracy_Pct", type number},
+        {"Power_Accuracy_Pct",     type number},
+        {"Pressure_Accuracy_kPa",  type number},
+        {"Notes",                  type text}
+    })
+in
+    Typed
