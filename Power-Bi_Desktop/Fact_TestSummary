@@ -1,0 +1,433 @@
+let
+    // pull thresholds from config
+    Cfg = Dim_Config{0},
+    SS_Gap_Max      = Cfg[SS_Gap_Max_Rows],
+    SS_Min_Block    = Cfg[SS_Min_Block_Rows],
+    NoMatch_Max     = Cfg[NoMatch_Max_Rows],
+    PoorSync_Max    = Cfg[PoorSync_Max_Rows],
+
+    // buffer for speed since we iterate over this a lot
+    RawAll = Table.Buffer(Fact_TestData_Raw),
+
+    TestIDs = List.Distinct(Table.Column(RawAll, "Test_ID")),
+
+    // go through each test and compute its summary
+    SummaryList = List.Transform(TestIDs, (testID) =>
+        let
+            AllRows = Table.SelectRows(RawAll,
+                each [Test_ID] = testID),
+
+            // rows that passed steady state, have valid Rth, and no sensor issues
+            SSCandidates = Table.SelectRows(AllRows,
+                each [Is_SteadyState] = 1
+                 and [Rth_Instant] <> null
+                 and [Sensor_Flag] = "OK"),
+
+            N_Total = Table.RowCount(AllRows),
+
+            // =============================================
+            // find the biggest contiguous steady state block
+            // small gaps (up to SS_Gap_Max buckets) get bridged
+            // =============================================
+            SSWithIndex = Table.AddIndexColumn(
+                Table.Sort(SSCandidates,
+                    {{"Elapsed_s", Order.Ascending}}),
+                "__SSIdx", 0, 1),
+
+            SSWithBlock =
+                if Table.RowCount(SSWithIndex) = 0 then SSWithIndex
+                else
+                let
+                    idxList = Table.Column(SSWithIndex, "BucketIndex"),
+                    blockIDs = List.Generate(
+                        () => [i = 0, blk = 0],
+                        each [i] < List.Count(idxList),
+                        each [
+                            i   = [i] + 1,
+                            blk = if [i] + 1 < List.Count(idxList)
+                                    and (idxList{[i] + 1} - idxList{[i]})
+                                        > SS_Gap_Max
+                                  then [blk] + 1
+                                  else [blk]
+                        ],
+                        each [blk]
+                    ),
+                    blockIDsBuf = List.Buffer(blockIDs),
+                    withBlk = Table.AddColumn(SSWithIndex, "__BlockID",
+                        each blockIDsBuf{[__SSIdx]}, Int64.Type)
+                in withBlk,
+
+            // count how many rows in each block and pick the biggest one
+            BlockCounts =
+                if Table.RowCount(SSWithBlock) = 0 then {}
+                else Table.Group(SSWithBlock, {"__BlockID"},
+                    {{"__N", each Table.RowCount(_), Int64.Type}}),
+            LargestBlockID =
+                if Table.RowCount(SSWithBlock) = 0 then null
+                else
+                let
+                    sorted = Table.Sort(BlockCounts,
+                        {{"__N", Order.Descending}})
+                in sorted{0}[__BlockID],
+
+            SSRows =
+                if LargestBlockID = null then SSWithBlock
+                else Table.SelectRows(SSWithBlock,
+                    each [__BlockID] = LargestBlockID),
+
+            N_SS    = Table.RowCount(SSRows),
+
+            // need at least SS_Min_Block rows or we cant trust the averages
+            HasSS = N_SS >= SS_Min_Block,
+
+            // =============================================
+            // average everything over the steady state window
+            // =============================================
+            Rth_SS   = if HasSS then List.Average(
+                Table.Column(SSRows, "Rth_Instant")) else null,
+            Tj_SS    = if HasSS then List.Average(
+                Table.Column(SSRows, "CPU_Cores_Mean_C")) else null,
+            Tin_SS   = if HasSS then List.Average(
+                Table.Column(SSRows, "IN_WB_C")) else null,
+            Tout_SS  = if HasSS then List.Average(
+                Table.Column(SSRows, "OUT_WB_C")) else null,
+            DeltaT_SS = if HasSS then List.Average(
+                Table.Column(SSRows, "DeltaT_C")) else null,
+            Power_SS = if HasSS then List.Average(
+                Table.Column(SSRows, "CPU_Power_W")) else null,
+            Q_SS     = if HasSS then List.Average(
+                Table.Column(SSRows, "Q_Instant_W")) else null,
+            Eff_SS   = if HasSS then List.Average(
+                Table.Column(SSRows, "Efficiency_Instant_Pct")) else null,
+            N_Active_Cores_SS = if HasSS then List.Max(
+                List.Select(
+                    Table.Column(SSRows, "N_Active_Cores"),
+                    each _ <> null))
+                else null,
+            TCores_SS = if HasSS then List.Average(
+                List.Select(
+                    Table.Column(SSRows, "CPU_Cores_Mean_C"),
+                    each _ <> null))
+                else null,
+            TCores_Min = if HasSS then List.Average(
+                List.Select(
+                    Table.Column(SSRows, "CPU_Cores_Min_C"),
+                    each _ <> null))
+                else null,
+            TCores_Max = if HasSS then List.Average(
+                List.Select(
+                    Table.Column(SSRows, "CPU_Cores_Max_C"),
+                    each _ <> null))
+                else null,
+
+            // =============================================
+            // pressure drop and hydraulic pumping power
+            // =============================================
+            dP_ColdPlate_SS = if HasSS then List.Average(
+                Table.Column(SSRows, "P_005_WB_KPa")) else null,
+            dP_AHEX_SS = if HasSS then List.Average(
+                Table.Column(SSRows, "P_AHEX_KPa")) else null,
+
+            FlowRate = Dim_Tests{[Test_ID = testID]}[FlowRate_Lpm],
+            // W_hyd = Vdot * dP (convert L/min to m³/s and kPa to Pa)
+            W_Hydraulic_SS = if dP_ColdPlate_SS <> null
+                then (FlowRate / 60 / 1000) * (dP_ColdPlate_SS * 1000)
+                else null,
+            P_System_SS = if Power_SS <> null and W_Hydraulic_SS <> null
+                then Power_SS + W_Hydraulic_SS
+                else null,
+
+            // =============================================
+            // uncertainty propagation
+            // follows Taylor method, same as used in the thesis
+            // =============================================
+            uTC   = Cfg[TC_Accuracy_C],         // thermocouple ±0.2°C
+            uDTS  = 5.0,                         // on die DTS ±5K
+            uPPct = Cfg[Power_Accuracy_Pct],     // HWiNFO power ±5%
+            uFPct = Cfg[FlowMeter_Accuracy_Pct], // flow meter ±3%
+            udP   = Cfg[Pressure_Accuracy_kPa],  // pressure sensor ±0.22 kPa
+
+            // random component from scatter in the steady state window
+            RthVals = Table.Column(SSRows, "Rth_Instant"),
+            Rth_StdDev_SS = if HasSS and N_SS >= 2
+                then List.StandardDeviation(RthVals) else null,
+            u_Rth_Random = if Rth_StdDev_SS <> null and N_SS > 0
+                then Rth_StdDev_SS / Number.Sqrt(N_SS) else null,
+
+            // systematic component from instrument accuracies
+            // Rth = (Tj - Tf_mean) / P so propagate through the division
+            u_Rth_Sys_SS =
+                if Rth_SS <> null and Tj_SS <> null and Power_SS <> null
+                   and Power_SS > 0
+                then
+                    let
+                        Tmean   = (Tin_SS + Tout_SS) / 2,
+                        dTnum   = Tj_SS - Tmean,
+                        u_Tmean = Number.Sqrt(uTC * uTC + uTC * uTC) / 2,
+                        u_dTnum = Number.Sqrt(uDTS * uDTS + u_Tmean * u_Tmean),
+                        rel_num = if Number.Abs(dTnum) > 0.1
+                                  then u_dTnum / Number.Abs(dTnum)
+                                  else 999,
+                        rel_pow = uPPct / 100,
+                        rel_Rth = Number.Sqrt(rel_num * rel_num + rel_pow * rel_pow)
+                    in  rel_Rth * Number.Abs(Rth_SS)
+                else null,
+
+            // combined = root sum of squares of random + systematic
+            u_Rth_Combined =
+                if u_Rth_Sys_SS <> null and u_Rth_Random <> null
+                then Number.Sqrt(
+                    u_Rth_Sys_SS * u_Rth_Sys_SS +
+                    u_Rth_Random * u_Rth_Random)
+                else null,
+
+            // same idea for Q uncertainty
+            QVals = Table.Column(SSRows, "Q_Instant_W"),
+            Q_StdDev_SS = if HasSS and N_SS >= 2
+                then List.StandardDeviation(QVals) else null,
+            u_Q_Random = if Q_StdDev_SS <> null and N_SS > 0
+                then Q_StdDev_SS / Number.Sqrt(N_SS) else null,
+
+            // Q = mdot * Cp * dT so propagate through the multiplication
+            u_Q_Sys_SS =
+                if Q_SS <> null and DeltaT_SS <> null
+                   and Number.Abs(DeltaT_SS) > 0.1
+                then
+                    let
+                        rel_flow = uFPct / 100,
+                        u_dT     = Number.Sqrt(uTC * uTC + uTC * uTC),
+                        rel_dT   = u_dT / Number.Abs(DeltaT_SS),
+                        rel_Q    = Number.Sqrt(
+                            rel_flow * rel_flow +
+                            rel_dT   * rel_dT)
+                    in  rel_Q * Number.Abs(Q_SS)
+                else null,
+
+            u_Q_Combined =
+                if u_Q_Sys_SS <> null and u_Q_Random <> null
+                then Number.Sqrt(
+                    u_Q_Sys_SS * u_Q_Sys_SS +
+                    u_Q_Random * u_Q_Random)
+                else null,
+
+            // individual temperature uncertainties are just the instrument accuracy
+            u_Tj_SS    = if Tj_SS <> null then uDTS else null,
+            u_Tin_SS   = if Tin_SS <> null then uTC else null,
+            u_Tout_SS  = if Tout_SS <> null then uTC else null,
+            // deltaT is a subtraction so root sum of squares
+            u_DeltaT_SS = if DeltaT_SS <> null
+                then Number.Sqrt(uTC * uTC + uTC * uTC)
+                else null,
+
+            u_Power_SS = if Power_SS <> null
+                then (uPPct / 100) * Number.Abs(Power_SS)
+                else null,
+
+            u_dP_SS = if dP_ColdPlate_SS <> null then udP else null,
+
+            // hydraulic power is a multiplication (Vdot * dP)
+            u_W_Hydraulic_SS =
+                if W_Hydraulic_SS <> null and dP_ColdPlate_SS <> null
+                   and Number.Abs(dP_ColdPlate_SS) > 0.01
+                then
+                    let
+                        rel_flow = uFPct / 100,
+                        rel_dP   = udP / Number.Abs(dP_ColdPlate_SS),
+                        rel_W    = Number.Sqrt(rel_flow * rel_flow + rel_dP * rel_dP)
+                    in  rel_W * Number.Abs(W_Hydraulic_SS)
+                else null,
+
+            // system power is an addition (CPU power + pumping power)
+            u_P_System_SS =
+                if u_Power_SS <> null and u_W_Hydraulic_SS <> null
+                then Number.Sqrt(
+                    u_Power_SS * u_Power_SS +
+                    u_W_Hydraulic_SS * u_W_Hydraulic_SS)
+                else null,
+
+            // =============================================
+            // LMTD and UA
+            // =============================================
+            // convert to Kelvin for LMTD calc
+            Tj_K   = if Tj_SS <> null   then Tj_SS + 273.15   else null,
+            Tin_K  = if Tin_SS <> null   then Tin_SS + 273.15  else null,
+            Tout_K = if Tout_SS <> null  then Tout_SS + 273.15 else null,
+            DT_hot  = if Tj_K <> null and Tin_K <> null
+                      then Tj_K - Tin_K else null,
+            DT_cold = if Tj_K <> null and Tout_K <> null
+                      then Tj_K - Tout_K else null,
+            // if hot and cold side deltas are basically equal just use one of them
+            // otherwise do the proper log mean
+            LMTD_SS = if DT_hot <> null and DT_cold <> null
+                         and DT_hot > 0 and DT_cold > 0
+                      then if Number.Abs(DT_hot - DT_cold) < 0.001
+                           then DT_hot
+                           else (DT_hot - DT_cold) /
+                                Number.Ln(DT_hot / DT_cold)
+                      else null,
+
+            // overall heat transfer conductance
+            UA_SS = if Q_SS <> null and LMTD_SS <> null and LMTD_SS > 0
+                    then Q_SS / LMTD_SS else null,
+
+            // =============================================
+            // timing info
+            // =============================================
+            SortedAll = Table.Sort(AllRows,
+                {{"Elapsed_s", Order.Ascending}}),
+            LastRow = SortedAll{Table.RowCount(SortedAll) - 1},
+            TestDuration_s = LastRow[Elapsed_s],
+            SSSorted = Table.Sort(SSRows,
+                {{"Elapsed_s", Order.Ascending}}),
+            SS_Start_s = if N_SS > 0
+                         then SSSorted{0}[Elapsed_s] else null,
+            SS_Duration_s = if N_SS > 0
+                            then SSSorted{N_SS - 1}[Elapsed_s]
+                                 - SSSorted{0}[Elapsed_s]
+                            else null,
+
+            // =============================================
+            // data quality checks
+            // any of these failing means the test gets flagged
+            // =============================================
+            ThrottleCount = Table.RowCount(
+                Table.SelectRows(AllRows,
+                    each [Is_Throttling] = true)),
+            PoorSyncCount = Table.RowCount(
+                Table.SelectRows(AllRows,
+                    each [Sync_Quality] = "Poor")),
+            NoMatchCount = Table.RowCount(
+                Table.SelectRows(AllRows,
+                    each [Sync_Quality] = "NO_MATCH")),
+            GoodSyncCount = Table.RowCount(
+                Table.SelectRows(AllRows,
+                    each [Sync_Quality] = "Good")),
+            SyncPassRate = if N_Total > 0
+                then Number.Round((GoodSyncCount / N_Total) * 100, 1)
+                else null,
+            SensorIssueCount = Table.RowCount(
+                Table.SelectRows(AllRows,
+                    each [Sensor_Flag] <> "OK")),
+            MaxSyncOffset = List.Max(
+                List.Select(
+                    Table.Column(AllRows, "Sync_Offset_s"),
+                    each _ <> null)),
+
+            // test is valid only if steady state was reached and nothing went wrong
+            ValidTest =
+                HasSS and
+                ThrottleCount = 0 and
+                NoMatchCount <= NoMatch_Max and
+                PoorSyncCount <= PoorSync_Max and
+                SensorIssueCount = 0
+
+        in [
+            Test_ID              = testID,
+            Rth_SS               = Rth_SS,
+            Tj_SS                = Tj_SS,
+            Tin_SS               = Tin_SS,
+            Tout_SS              = Tout_SS,
+            DeltaT_SS            = DeltaT_SS,
+            Power_SS             = Power_SS,
+            Q_SS                 = Q_SS,
+            Efficiency_SS        = Eff_SS,
+            N_Active_Cores       = N_Active_Cores_SS,
+            TCores_Mean_SS       = TCores_SS,
+            TCores_Min_SS        = TCores_Min,
+            TCores_Max_SS        = TCores_Max,
+            dT_Cores_Mean_SS     = if TCores_SS <> null and Tin_SS <> null and Tout_SS <> null then TCores_SS - (Tin_SS + Tout_SS) / 2 else null,
+            dT_Cores_Min_SS      = if TCores_Min <> null and Tin_SS <> null and Tout_SS <> null then TCores_Min - (Tin_SS + Tout_SS) / 2 else null,
+            dT_Cores_Max_SS      = if TCores_Max <> null and Tin_SS <> null and Tout_SS <> null then TCores_Max - (Tin_SS + Tout_SS) / 2 else null,
+            LMTD_SS              = LMTD_SS,
+            UA_SS                = UA_SS,
+            dP_ColdPlate_SS      = dP_ColdPlate_SS,
+            dP_AHEX_SS           = dP_AHEX_SS,
+            W_Hydraulic_SS       = W_Hydraulic_SS,
+            P_System_SS          = P_System_SS,
+            SS_Start_s           = SS_Start_s,
+            SS_Duration_s        = SS_Duration_s,
+            N_Total              = N_Total,
+            N_SteadyState        = N_SS,
+            TestDuration_min     = Number.Round(TestDuration_s / 60, 1),
+            ThrottlingEvents     = ThrottleCount,
+            PoorSyncEvents       = PoorSyncCount,
+            NoMatchEvents        = NoMatchCount,
+            SensorIssueEvents    = SensorIssueCount,
+            MaxSyncOffset_s      = MaxSyncOffset,
+            Sync_Pass_Rate_Pct   = SyncPassRate,
+            ValidTest            = ValidTest,
+            Rth_StdDev_SS        = Rth_StdDev_SS,
+            u_Rth_Random         = u_Rth_Random,
+            u_Rth_Sys_SS         = u_Rth_Sys_SS,
+            u_Rth_Combined       = u_Rth_Combined,
+            Q_StdDev_SS          = Q_StdDev_SS,
+            u_Q_Random           = u_Q_Random,
+            u_Q_Sys_SS           = u_Q_Sys_SS,
+            u_Q_Combined         = u_Q_Combined,
+            u_Tj_SS              = u_Tj_SS,
+            u_Tin_SS             = u_Tin_SS,
+            u_Tout_SS            = u_Tout_SS,
+            u_DeltaT_SS          = u_DeltaT_SS,
+            u_Power_SS           = u_Power_SS,
+            u_dP_SS              = u_dP_SS,
+            u_W_Hydraulic_SS     = u_W_Hydraulic_SS,
+            u_P_System_SS        = u_P_System_SS
+        ]
+    ),
+
+    Result = Table.FromRecords(SummaryList),
+
+    Typed = Table.TransformColumnTypes(Result, {
+        {"Test_ID",              type text},
+        {"Rth_SS",               type number},
+        {"Tj_SS",                type number},
+        {"Tin_SS",               type number},
+        {"Tout_SS",              type number},
+        {"DeltaT_SS",            type number},
+        {"Power_SS",             type number},
+        {"Q_SS",                 type number},
+        {"Efficiency_SS",        type number},
+        {"N_Active_Cores",       Int64.Type},
+        {"TCores_Mean_SS",       type number},
+        {"TCores_Min_SS",        type number},
+        {"TCores_Max_SS",        type number},
+        {"dT_Cores_Mean_SS",     type number},
+        {"dT_Cores_Min_SS",      type number},
+        {"dT_Cores_Max_SS",      type number},
+        {"LMTD_SS",              type number},
+        {"UA_SS",                type number},
+        {"dP_ColdPlate_SS",      type number},
+        {"dP_AHEX_SS",           type number},
+        {"W_Hydraulic_SS",       type number},
+        {"P_System_SS",          type number},
+        {"SS_Start_s",           type number},
+        {"SS_Duration_s",        type number},
+        {"N_Total",              Int64.Type},
+        {"N_SteadyState",        Int64.Type},
+        {"TestDuration_min",     type number},
+        {"ThrottlingEvents",     Int64.Type},
+        {"PoorSyncEvents",       Int64.Type},
+        {"NoMatchEvents",        Int64.Type},
+        {"SensorIssueEvents",    Int64.Type},
+        {"MaxSyncOffset_s",      type number},
+        {"Sync_Pass_Rate_Pct",   type number},
+        {"ValidTest",            type logical},
+        {"Rth_StdDev_SS",        type number},
+        {"u_Rth_Random",         type number},
+        {"u_Rth_Sys_SS",         type number},
+        {"u_Rth_Combined",       type number},
+        {"Q_StdDev_SS",          type number},
+        {"u_Q_Random",           type number},
+        {"u_Q_Sys_SS",           type number},
+        {"u_Q_Combined",         type number},
+        {"u_Tj_SS",              type number},
+        {"u_Tin_SS",             type number},
+        {"u_Tout_SS",            type number},
+        {"u_DeltaT_SS",          type number},
+        {"u_Power_SS",           type number},
+        {"u_dP_SS",              type number},
+        {"u_W_Hydraulic_SS",     type number},
+        {"u_P_System_SS",        type number}
+    })
+in
+    Typed
