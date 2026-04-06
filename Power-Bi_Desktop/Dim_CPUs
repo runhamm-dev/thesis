@@ -1,0 +1,43 @@
+let
+    // CPUs used in this study
+    Source = Table.FromRecords({
+        [
+            CPU_Model      = "i5-12600K",
+            Manufacturer   = "Intel",
+            Generation     = "12th Gen (Alder Lake)",
+            P_Cores        = 6,
+            E_Cores        = 4,
+            TDP_W          = 125,
+            TjMax_C        = 100,
+            Socket         = "LGA 1700",
+            StressFreq_GHz = 4.9,       // all-core frequency during stress testing
+            BaseFreq_GHz   = 3.7
+        ],
+        [
+            CPU_Model      = "i9-10900K",
+            Manufacturer   = "Intel",
+            Generation     = "10th Gen (Comet Lake)",
+            P_Cores        = 10,
+            E_Cores        = 0,
+            TDP_W          = 125,
+            TjMax_C        = 100,
+            Socket         = "LGA 1200",
+            StressFreq_GHz = 4.9,
+            BaseFreq_GHz   = 3.7
+        ]
+    }),
+
+    Typed = Table.TransformColumnTypes(Source, {
+        {"CPU_Model",      type text},
+        {"Manufacturer",   type text},
+        {"Generation",     type text},
+        {"P_Cores",        Int64.Type},
+        {"E_Cores",        Int64.Type},
+        {"TDP_W",          Int64.Type},
+        {"TjMax_C",        Int64.Type},
+        {"Socket",         type text},
+        {"StressFreq_GHz", type number},
+        {"BaseFreq_GHz",   type number}
+    })
+in
+    Typed
