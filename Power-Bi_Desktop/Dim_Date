@@ -1,0 +1,24 @@
+let
+    // date dimension covering the full testing period
+    StartDate = #date(2026, 1, 1),
+    EndDate   = #date(2027, 12, 31),
+    DayCount  = Duration.Days(EndDate - StartDate) + 1,
+    DateList  = List.Dates(StartDate, DayCount, #duration(1,0,0,0)),
+    ToTable   = Table.FromList(DateList, Splitter.SplitByNothing(),
+                    {"Date"}, null, ExtraValues.Error),
+    Typed     = Table.TransformColumnTypes(ToTable,
+                    {{"Date", type date}}),
+
+    // break out the useful date parts for slicers and grouping
+    AddYear      = Table.AddColumn(Typed, "Year",
+                       each Date.Year([Date]), Int64.Type),
+    AddMonth     = Table.AddColumn(AddYear, "MonthNum",
+                       each Date.Month([Date]), Int64.Type),
+    AddMonthName = Table.AddColumn(AddMonth, "MonthName",
+                       each Date.MonthName([Date]), type text),
+    AddWeek      = Table.AddColumn(AddMonthName, "WeekNum",
+                       each Date.WeekOfYear([Date]), Int64.Type),
+    AddDay       = Table.AddColumn(AddWeek, "DayOfWeek",
+                       each Date.DayOfWeekName([Date]), type text)
+in
+    AddDay
