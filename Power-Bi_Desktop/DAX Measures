@@ -1,0 +1,73 @@
+DeltaT = AVERAGE(Fact_TestSummary[DeltaT_SS])
+
+// pressure drop across the cold plate only
+dP_ColdPlate = AVERAGE(Fact_TestSummary[dP_ColdPlate_SS])
+
+// core temp minus average coolant temp, shows how hard the cold plate is working
+dT_Cores_Max = 
+AVERAGE(Fact_TestSummary[TCores_Max_SS]) 
+    - (AVERAGE(Fact_TestSummary[Tin_SS]) + AVERAGE(Fact_TestSummary[Tout_SS])) / 2
+
+dT_Cores_Mean = 
+AVERAGE(Fact_TestSummary[TCores_Mean_SS]) 
+    - (AVERAGE(Fact_TestSummary[Tin_SS]) + AVERAGE(Fact_TestSummary[Tout_SS])) / 2
+
+dT_Cores_Min = 
+AVERAGE(Fact_TestSummary[TCores_Min_SS]) 
+    - (AVERAGE(Fact_TestSummary[Tin_SS]) + AVERAGE(Fact_TestSummary[Tout_SS])) / 2
+
+// tests where Rth never stabilised, usually means the test was too short
+Failed_SS_Count = 
+CALCULATE(
+    COUNTROWS(Fact_TestSummary),
+    Fact_TestSummary[N_SteadyState] < 10
+) + 0
+
+// rows where HWiNFO and LabVIEW couldnt be matched at all
+NoMatch_Events_Total = SUM(Fact_TestSummary[NoMatchEvents]) + 0
+
+// total system power (CPU + pump) formatted with uncertainty
+P_System_With_Uncertainty = 
+FORMAT([Power] + [W_Hydraulic], "0.0") & " ± " & FORMAT([u_P_System], "0.0") & " W"
+
+// only counts rows where sync was Poor, NO_MATCH is tracked separately above
+Poor_Sync_Events_Total = SUM(Fact_TestSummary[PoorSyncEvents]) + 0
+
+// CPU power formatted with its uncertainty band
+Power_With_Uncertainty = 
+FORMAT([Power], "0.0") & " ± " & FORMAT([u_Power], "0.0") & " W"
+
+// quick check on whether the test data is usable
+// throttling or sensor issues = instant fail, poor sync = warning
+Quality_Status = 
+VAR Throttle = [Throttling_Events_Total]
+VAR Sync     = [Poor_Sync_Events_Total]
+VAR Sensor   = [Sensor_Issue_Events_Total]
+RETURN
+    IF(Throttle > 0 || Sensor > 0,
+        "FAIL",
+        IF(Sync > 0, "WARN", "PASS")
+    )
+
+// rows where a temperature reading was outside the expected range
+Sensor_Issue_Events_Total = SUM(Fact_TestSummary[SensorIssueEvents]) + 0
+
+// what fraction of the test was actually in steady state
+// low values usually mean the test needed to run longer
+SS_Coverage_Pct = 
+DIVIDE(
+    AVERAGE(Fact_TestSummary[N_SteadyState]),
+    AVERAGE(Fact_TestSummary[N_Total]),
+    0
+) * 100
+
+// how many tests passed all the quality checks
+Valid_Test_Count = 
+CALCULATE(
+    COUNTROWS(Fact_TestSummary),
+    Fact_TestSummary[ValidTest] = TRUE
+) + 0
+
+// hydraulic pumping power formatted with uncertainty
+W_Hydraulic_With_Uncertainty = 
+FORMAT([W_Hydraulic], "0.000") & " ± " & FORMAT([u_W_Hydraulic], "0.000") & " W"
