@@ -1,0 +1,43 @@
+let
+    // cold plates used in this study
+    Source = Table.FromRecords({
+        [
+            ColdPlate_ID     = "Nexalus-01",
+            Manufacturer     = "Nexalus",
+            Model            = "Baseline",
+            FinType          = "Hybrid",
+            Material         = "Aluminium",
+            Mass_g           = null,
+            Cost_EUR         = null,
+            DesignIteration  = 1,
+            DateFirstTested  = #date(2026, 3, 27),
+            MountingHardware = "Nexalus Torque Screws"
+        ],
+        [
+            ColdPlate_ID     = "Nexalus-02",
+            Manufacturer     = "Nexalus",
+            Model            = "Optimised Baseline",
+            FinType          = "Hybrid",
+            Material         = "Aluminum",
+            Mass_g           = null,
+            Cost_EUR         = null,
+            DesignIteration  = 1,
+            DateFirstTested  = #date(2026, 3, 27),
+            MountingHardware = "Nexalus Torque Screws"
+        ]
+    }),
+
+    Typed = Table.TransformColumnTypes(Source, {
+        {"ColdPlate_ID",     type text},
+        {"Manufacturer",     type text},
+        {"Model",            type text},
+        {"FinType",          type text},
+        {"Material",         type text},
+        {"Mass_g",           type number},
+        {"Cost_EUR",         type number},
+        {"DesignIteration",  Int64.Type},
+        {"DateFirstTested",  type date},
+        {"MountingHardware", type text}
+    })
+in
+    Typed
