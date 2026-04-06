@@ -1,0 +1,88 @@
+let
+    // only care about tests where both the LVM and CSV file exist
+    Complete = Table.SelectRows(Staging_MatchedPairs,
+        each [Pair_Status] = "COMPLETE"),
+
+    // pull metadata out of the Test_ID string
+    // format is: YYYYMMDD_plateID_cpuModel_XpXLpm_XXC_RunXX
+    AddMeta = Table.AddColumn(Complete, "Meta", each
+        let
+            P = Text.Split([Test_ID], "_"),
+            TestDate = Date.FromText(
+                Text.Range(P{0},0,4) & "-" &
+                Text.Range(P{0},4,2) & "-" &
+                Text.Range(P{0},6,2)),
+            Plate = P{1},
+            CPU = P{2},
+            // "3p3Lpm" becomes 3.3
+            FlowClean = Text.Replace(
+                Text.BeforeDelimiter(P{3}, "Lpm"), "p", "."),
+            Flow = Number.From(FlowClean),
+            // "25C" becomes 25
+            Inlet = Number.From(
+                Text.BeforeDelimiter(P{4}, "C")),
+            // "Run01" becomes 1
+            RunNum = Number.From(
+                Text.AfterDelimiter(P{5}, "Run"))
+        in [
+            Test_Date        = TestDate,
+            ColdPlate_ID     = Plate,
+            CPU_Model        = CPU,
+            FlowRate_Lpm     = Flow,
+            InletSetpoint_C  = Inlet,
+            RunNumber        = RunNum
+        ]),
+
+    Expanded = Table.ExpandRecordColumn(AddMeta, "Meta", {
+        "Test_Date", "ColdPlate_ID", "CPU_Model",
+        "FlowRate_Lpm", "InletSetpoint_C",
+        "RunNumber"
+    }),
+
+    // shorter label for charts/slicers, e.g. "3p0Lpm_25C_Run01"
+    AddShortID = Table.AddColumn(Expanded, "Test_ID_Short", each
+        let P = Text.Split([Test_ID], "_")
+        in P{3} & "_" & P{4} & "_" & P{5},
+        type text),
+
+    // figure out which config was active on the day the test was run
+    AddConfigID = Table.AddColumn(AddShortID, "Config_ID", each
+        let
+            D  = [Test_Date],
+            Cfg = Table.SelectRows(Dim_Config, (c) =>
+                c[ValidFrom] <= D and
+                (c[ValidTo] = null or c[ValidTo] >= D))
+        in  if Table.RowCount(Cfg) > 0
+            then Cfg{0}[Config_ID]
+            else 1,   // default to first config if nothing matches
+        Int64.Type),
+
+    // trim down to just the columns the model needs
+    Final = Table.SelectColumns(AddConfigID, {
+        "Test_ID", "Test_ID_Short", "Test_Date", "ColdPlate_ID", "CPU_Model",
+        "FlowRate_Lpm", "InletSetpoint_C",
+        "RunNumber", "Config_ID",
+        "LVM_Path", "CSV_Path",
+        "LVM_Filename", "CSV_Filename",
+        "LVM_Content", "CSV_Content"
+    }),
+
+    Typed = Table.TransformColumnTypes(Final, {
+        {"Test_ID",          type text},
+        {"Test_ID_Short",    type text},
+        {"Test_Date",        type date},
+        {"ColdPlate_ID",     type text},
+        {"CPU_Model",        type text},
+        {"FlowRate_Lpm",     type number},
+        {"InletSetpoint_C",  type number},
+        {"RunNumber",        Int64.Type},
+        {"Config_ID",        Int64.Type},
+        {"LVM_Path",         type text},
+        {"CSV_Path",         type text},
+        {"LVM_Filename",     type text},
+        {"CSV_Filename",     type text},
+        {"LVM_Content",      type binary},
+        {"CSV_Content",      type binary}
+    })
+in
+    Typed
