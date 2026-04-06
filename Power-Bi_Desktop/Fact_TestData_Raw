@@ -1,0 +1,485 @@
+let
+    // grab all the config values we need upfront
+    Cfg = Dim_Config{0},
+    BucketWidth = Cfg[Bucket_Width_s],
+    Cp       = Cfg[Cp_Water],
+    Density  = Cfg[Water_Density_kg_m3],
+    SyncTol  = Cfg[Sync_Tolerance_s],
+    SSWindow = Cfg[SS_Window_Rows],
+    SSThresh = Cfg[SS_Threshold],
+    TempMin  = Cfg[Anomaly_Temp_Min_C],
+    TempMax  = Cfg[Anomaly_Temp_Max_C],
+
+    Tests = Table.Buffer(Dim_Tests),
+
+    // loop through every test and process it
+    ProcessedList = List.Transform(
+        Table.ToRecords(Tests),
+        (testRow) =>
+        let
+            TestID   = testRow[Test_ID],
+            FlowRate = testRow[FlowRate_Lpm],
+            ConfigID = testRow[Config_ID],
+            // use the config that was active when the test was run
+            TestCfg  = try Dim_Config{[Config_ID = ConfigID]}
+                       otherwise Cfg,
+
+            // =============================================
+            // PART A: Parse the LabVIEW file (.lvm)
+            // =============================================
+            LVM_Raw = Csv.Document(
+                testRow[LVM_Content],
+                [Delimiter = "#(tab)", Columns = 13,
+                 Encoding = 65001,
+                 QuoteStyle = QuoteStyle.None]),
+
+            // the date and time are buried in the header
+            // line 9 has the date, line 10 has the time
+            LVM_RawDate = LVM_Raw{9}[Column2],
+            LVM_RawTime = Text.Start(LVM_Raw{10}[Column2], 8),
+            StartDT = DateTime.FromText(
+                LVM_RawDate & " " & LVM_RawTime),
+
+            // strip out everything that isnt actual data
+            DataOnly = Table.SelectRows(LVM_Raw, each
+                (try Number.From([Column1]) otherwise null) <> null),
+
+            // column positions can change between files so we find
+            // the header row and match sensor names by searching the text
+            HeaderTable = Table.SelectRows(LVM_Raw, each
+                    Text.StartsWith(Text.Trim([Column1]), "X_Value")),
+            HeaderRow = if Table.RowCount(HeaderTable) > 0
+                then HeaderTable{0}
+                else null,
+            HeaderNames = if HeaderRow <> null
+                then Record.FieldValues(HeaderRow)
+                else List.Repeat({""}, 13),
+
+            // each entry is {what we want to call it, how to find it in the header}
+            SensorLookup = {
+                {"IN_WB_C",       each Text.Contains(_, "IN") and Text.Contains(_, "WB") and not Text.Contains(_, "AHEX")},
+                {"IN_AHEX_C",     each Text.Contains(_, "IN") and Text.Contains(_, "AHEX")},
+                {"OUT_WB_C",      each Text.Contains(_, "OUT") and Text.Contains(_, "WB") and not Text.Contains(_, "AHEX")},
+                {"OUT_AHEX_C",    each Text.Contains(_, "OUT") and Text.Contains(_, "AHEX")},
+                {"P_AHEX_KPa",      each Text.Contains(_, "P-005") and Text.Contains(_, "AHEX")},
+                {"P_005_WB_KPa",    each Text.Contains(_, "P-005") and Text.Contains(_, "WB") and not Text.Contains(_, "AHEX")}
+            },
+
+            // work out which Column# each sensor ended up in
+            FindColumn = (matchFn) =>
+                let
+                    idx = List.PositionOf(
+                        List.Transform(HeaderNames, matchFn), true)
+                in  if idx >= 0
+                    then "Column" & Text.From(idx + 1)
+                    else null,
+
+            // build the rename list for sensors we actually found
+            RenamePairs = List.Select(
+                List.Transform(SensorLookup, each
+                    let col = FindColumn(_{1})
+                    in  if col <> null then {col, _{0}} else null),
+                each _ <> null),
+
+            AllRenames = List.Combine({
+                {{"Column1", "X_Value_s"}},
+                RenamePairs
+            }),
+            Renamed_Raw = Table.RenameColumns(DataOnly, AllRenames),
+
+            // if a sensor wasnt in this file just add it as null
+            FoundSensors = List.Transform(RenamePairs, each _{1}),
+            AllSensors = {"IN_WB_C","IN_AHEX_C","OUT_WB_C",
+                          "OUT_AHEX_C","P_AHEX_KPa",
+                          "P_005_WB_KPa"},
+            MissingSensors = List.Select(AllSensors,
+                each not List.Contains(FoundSensors, _)),
+            Renamed = List.Accumulate(
+                MissingSensors, Renamed_Raw,
+                (tbl, col) => Table.AddColumn(tbl, col, each null)),
+
+            LVM_Typed = Table.TransformColumnTypes(Renamed, {
+                {"X_Value_s",     type number},
+                {"IN_WB_C",    type number},
+                {"IN_AHEX_C",  type number},
+                {"OUT_WB_C",   type number},
+                {"OUT_AHEX_C", type number},
+                {"P_AHEX_KPa",      type number},
+                {"P_005_WB_KPa",    type number}
+            }),
+
+            // group the raw readings into 2 second buckets
+            LVM_Bucketed = Table.AddColumn(LVM_Typed,
+                "BucketIndex",
+                each Number.RoundDown([X_Value_s] / BucketWidth),
+                Int64.Type),
+
+            // average the LabVIEW readings within each bucket
+            LV_Grouped = Table.Group(LVM_Bucketed, {"BucketIndex"}, {
+                {"Elapsed_s",       each List.Average([X_Value_s]),      type number},
+                {"IN_WB_C",      each List.Average([IN_WB_C]),    type number},
+                {"IN_AHEX_C",    each List.Average([IN_AHEX_C]),  type number},
+                {"OUT_WB_C",     each List.Average([OUT_WB_C]),   type number},
+                {"OUT_AHEX_C",   each List.Average([OUT_AHEX_C]), type number},
+                {"P_AHEX_KPa",        each List.Average([P_AHEX_KPa]),      type number},
+                {"P_005_WB_KPa",      each List.Average([P_005_WB_KPa]),    type number},
+                {"LV_RowCount",     each Table.RowCount(_),             Int64.Type}
+            }),
+
+            // pressure should always be positive
+            LV_AbsP = Table.TransformColumns(LV_Grouped, {
+                {"P_AHEX_KPa",   each if _ <> null then Number.Abs(_) else null, type number},
+                {"P_005_WB_KPa", each if _ <> null then Number.Abs(_) else null, type number}
+            }),
+
+            // rebuild the actual timestamp from the start time + elapsed
+            LV_WithDT = Table.AddColumn(LV_AbsP, "Timestamp",
+                each StartDT + #duration(0, 0, 0, [Elapsed_s]),
+                type datetime),
+
+            // =============================================
+            // PART B: Parse the HWiNFO file (.CSV)
+            // =============================================
+            HW_Source = Csv.Document(
+                testRow[CSV_Content],
+                [Delimiter = ",", Encoding = 1252,
+                 QuoteStyle = QuoteStyle.Csv]),
+            HW_Headers = Table.PromoteHeaders(HW_Source,
+                [PromoteAllScalars = true]),
+
+            // find column names dynamically since HWiNFO headers
+            // change depending on what sensors are enabled
+            AllCols = Table.ColumnNames(HW_Headers),
+
+            // CPU package temp columns, making sure we dont grab the power one
+            CPUTempCols = List.Select(AllCols, each
+                Text.Contains(_, "CPU Package") and
+                Text.Contains(_, "C]") and
+                not Text.Contains(_, "Power")),
+
+            // all the individual core temp columns
+            // theres a lot of junk in HWiNFO exports so we filter hard
+            CoreTempCols = List.Select(AllCols, each
+                (Text.StartsWith(_, "P-core") or Text.StartsWith(_, "E-core") or Text.StartsWith(_, "Core")) and
+                Text.Contains(_, "C]") and
+                not Text.Contains(_, "Distance") and
+                not Text.Contains(_, "Power") and
+                not Text.Contains(_, "VID") and
+                not Text.Contains(_, "Clock") and
+                not Text.Contains(_, "Throttling") and
+                not Text.Contains(_, "Critical") and
+                not Text.Contains(_, "Limit") and
+                not Text.Contains(_, "Usage") and
+                not Text.Contains(_, "Utility") and
+                not Text.Contains(_, "Ratio") and
+                not Text.Contains(_, "Max") and
+                not Text.Contains(_, "Effective")),
+
+            N_CoreTempCols = List.Count(CoreTempCols),
+
+            PowerCol = List.First(List.Select(AllCols, each
+                Text.Contains(_, "CPU Package Power")), null),
+
+            // HWiNFO uses European date format (D.M.YYYY)
+            HW_AddDT = Table.AddColumn(HW_Headers, "DateTime_HW",
+                each try
+                    let
+                        Pts   = Text.Split([Date], "."),
+                        Day   = Text.PadStart(Pts{0}, 2, "0"),
+                        Month = Text.PadStart(Pts{1}, 2, "0"),
+                        Year  = Pts{2},
+                        D     = Date.FromText(Year & "-" & Month & "-" & Day),
+                        T     = Time.FromText(Text.Start([Time], 8))
+                    in  D & T
+                otherwise null,
+                type datetime),
+
+            // get rid of any rows where the datetime didnt parse (header repeats etc)
+            HW_Clean = Table.SelectRows(HW_AddDT,
+                each [DateTime_HW] <> null),
+
+            // grab CPU package temp from the first DTS sensor column
+            HW_AddTj = Table.AddColumn(HW_Clean, "CPU_Package_C",
+                each try Number.From(
+                    Record.Field(_, List.First(CPUTempCols)))
+                otherwise null,
+                type number),
+
+            // check that the package sensors agree within 3°C
+            // if they dont something is off
+            HW_AddMatch = Table.AddColumn(HW_AddTj, "CPU_Package_Match",
+                each
+                    let
+                        Vals = List.Transform(CPUTempCols, (col) =>
+                            try Number.From(Record.Field(_, col))
+                            otherwise null),
+                        NonNull = List.Select(Vals, each _ <> null),
+                        Spread = if List.Count(NonNull) > 1
+                                 then List.Max(NonNull) - List.Min(NonNull)
+                                 else 0
+                    in  if Spread <= 3 then "MATCH"
+                        else "MISMATCH",
+                type text),
+
+            // get the mean, min, max across all active core temps in one pass
+            HW_AddCoreStats = Table.AddColumn(HW_AddMatch,
+                "__CoreStats",
+                each
+                    let
+                        Vals  = List.Transform(CoreTempCols, (col) =>
+                                    try Number.From(Record.Field(_, col))
+                                    otherwise null),
+                        Valid = List.Select(Vals, each _ <> null)
+                    in  if List.Count(Valid) > 0
+                        then {List.Average(Valid), List.Min(Valid), List.Max(Valid)}
+                        else {null, null, null},
+                type list),
+            HW_AddCores    = Table.AddColumn(HW_AddCoreStats,
+                "CPU_Cores_Mean_C", each [__CoreStats]{0}, type number),
+            HW_AddCoresMin = Table.AddColumn(HW_AddCores,
+                "CPU_Cores_Min_C",  each [__CoreStats]{1}, type number),
+            HW_AddCoresMax = Table.AddColumn(HW_AddCoresMin,
+                "CPU_Cores_Max_C",  each [__CoreStats]{2}, type number),
+            HW_DropCoreStats = Table.RemoveColumns(HW_AddCoresMax, {"__CoreStats"}),
+
+            HW_AddNCores = Table.AddColumn(HW_DropCoreStats,
+                "N_Active_Cores", each N_CoreTempCols, Int64.Type),
+
+            HW_AddPower = Table.AddColumn(HW_AddNCores,
+                "CPU_Power_W",
+                each try Number.From(Record.Field(_, PowerCol))
+                otherwise null,
+                type number),
+
+            // check if any core or package was thermally throttling
+            ThrottleCols = List.Select(AllCols, each
+                Text.Contains(_, "Thermal Throttling [Yes/No]")),
+            HW_AddThrottle = Table.AddColumn(HW_AddPower,
+                "Is_Throttling",
+                each
+                    let
+                        Vals = List.Transform(ThrottleCols, (col) =>
+                            try Record.Field(_, col) otherwise "No")
+                    in  if List.Contains(Vals, "Yes")
+                        then true else false,
+                type logical),
+
+            // check if any power limit was hit (PL1 or PL2)
+            PLCols = List.Select(AllCols, each
+                Text.Contains(_, "Power Limit Exceeded [Yes/No]") or
+                Text.Contains(_, "RAPL/PBM PL1 [Yes/No]") or
+                Text.Contains(_, "RAPL/PBM PL2")),
+            HW_AddPL = Table.AddColumn(HW_AddThrottle,
+                "Is_PowerLimitExceeded",
+                each
+                    let
+                        Vals = List.Transform(PLCols, (col) =>
+                            try Record.Field(_, col) otherwise "No")
+                    in  if List.Contains(Vals, "Yes")
+                        then true else false,
+                type logical),
+
+            // work out elapsed time from the first HWiNFO row
+            HW_Sorted = Table.Sort(HW_AddPL,
+                {{"DateTime_HW", Order.Ascending}}),
+            HW_StartDT = HW_Sorted{0}[DateTime_HW],
+            HW_AddElapsed = Table.AddColumn(HW_Sorted,
+                "HW_Elapsed_s", each
+                    Duration.TotalSeconds([DateTime_HW] - HW_StartDT),
+                type number),
+
+            // align HWiNFO into the same 2 second buckets as LabVIEW
+            // using the time offset between the two start times
+            TimeOffset_s = Duration.TotalSeconds(HW_StartDT - StartDT),
+            HW_AddBucket = Table.AddColumn(HW_AddElapsed,
+                "BucketIndex", each
+                    Number.RoundDown(
+                        ([HW_Elapsed_s] + TimeOffset_s) / BucketWidth),
+                Int64.Type),
+
+            // only keep the columns we need for the join
+            HW_ForJoin = Table.SelectColumns(HW_AddBucket, {
+                "BucketIndex", "DateTime_HW",
+                "CPU_Package_C", "CPU_Package_Match",
+                "CPU_Cores_Mean_C", "CPU_Cores_Min_C", "CPU_Cores_Max_C",
+                "N_Active_Cores", "CPU_Power_W",
+                "Is_Throttling", "Is_PowerLimitExceeded"
+            }),
+
+            // if multiple HWiNFO rows land in the same bucket just take the first
+            HW_Dedup = Table.Distinct(HW_ForJoin, {"BucketIndex"}),
+
+            // =============================================
+            // PART C: Join the two sources on BucketIndex
+            // =============================================
+            Merged = Table.NestedJoin(
+                LV_WithDT, "BucketIndex",
+                HW_Dedup,  "BucketIndex",
+                "HW", JoinKind.LeftOuter),
+            Expanded = Table.ExpandTableColumn(Merged, "HW", {
+                "DateTime_HW", "CPU_Package_C", "CPU_Package_Match",
+                "CPU_Cores_Mean_C", "CPU_Cores_Min_C", "CPU_Cores_Max_C",
+                "N_Active_Cores", "CPU_Power_W",
+                "Is_Throttling", "Is_PowerLimitExceeded"
+            }),
+
+            // how far apart were the LV and HW timestamps for this bucket
+            AddSyncOffset = Table.AddColumn(Expanded,
+                "Sync_Offset_s", each
+                    if [DateTime_HW] = null then null
+                    else Number.Abs(
+                        Duration.TotalSeconds([Timestamp] - [DateTime_HW])),
+                type number),
+
+            // =============================================
+            // PART D: Thermal calculations
+            // =============================================
+
+            // coolant temperature rise
+            AddDeltaT = Table.AddColumn(AddSyncOffset,
+                "DeltaT_C",
+                each [OUT_WB_C] - [IN_WB_C],
+                type number),
+
+            // thermal resistance: Rth = (Tj_mean - Tf_mean) / P
+            // where Tf_mean is the average of inlet and outlet
+            AddRth = Table.AddColumn(AddDeltaT,
+                "Rth_Instant", each
+                    if [CPU_Cores_Mean_C] <> null and
+                       [CPU_Power_W] <> null and
+                       [CPU_Power_W] > 0
+                    then ([CPU_Cores_Mean_C] - (([IN_WB_C] + [OUT_WB_C]) / 2)) / [CPU_Power_W]
+                    else null,
+                type number),
+
+            // heat absorbed by coolant: Q = mdot * Cp * deltaT
+            // flow is in L/min so convert to m³/s first
+            AddQ = Table.AddColumn(AddRth,
+                "Q_Instant_W", each
+                    (FlowRate / 60 / 1000) *
+                    TestCfg[Water_Density_kg_m3] *
+                    TestCfg[Cp_Water] *
+                    [DeltaT_C],
+                type number),
+
+            // what fraction of the CPU power actually ends up in the coolant
+            AddEff = Table.AddColumn(AddQ,
+                "Efficiency_Instant_Pct", each
+                    if [CPU_Power_W] <> null and [CPU_Power_W] > 0
+                    then ([Q_Instant_W] / [CPU_Power_W]) * 100
+                    else null,
+                type number),
+
+            // label how well the two data sources lined up
+            AddSyncQ = Table.AddColumn(AddEff,
+                "Sync_Quality", each
+                    if [Sync_Offset_s] = null then "NO_MATCH"
+                    else if [Sync_Offset_s] <= SyncTol then "Good"
+                    else if [Sync_Offset_s] <= SyncTol * 2.5 then "OK"
+                    else "Poor",
+                type text),
+
+            // flag any temperatures that are clearly wrong
+            AddSensorFlag = Table.AddColumn(AddSyncQ,
+                "Sensor_Flag", each
+                    let
+                        Tin  = [IN_WB_C],
+                        Tout = [OUT_WB_C],
+                        Tj   = [CPU_Cores_Mean_C],
+                        InRange = (v) => v >= TempMin and v <= TempMax,
+                        Issues = List.Select({
+                            if not InRange(Tin) then "Tin_OOR" else null,
+                            if not InRange(Tout) then "Tout_OOR" else null,
+                            if Tj <> null and not InRange(Tj)
+                                then "Tj_OOR" else null
+                        }, each _ <> null)
+                    in  if List.Count(Issues) = 0 then "OK"
+                        else Text.Combine(Issues, "; "),
+                type text),
+
+            // =============================================
+            // PART E: Steady state detection
+            // =============================================
+            // rolling std dev of Rth over a ±15 row window
+            // if its below the threshold we call that row steady state
+            Sorted = Table.Sort(AddSensorFlag,
+                {{"Elapsed_s", Order.Ascending}}),
+
+            Indexed = Table.AddIndexColumn(Sorted, "RowIdx", 0, 1, Int64.Type),
+
+            // buffer the whole Rth column for speed
+            RthList = List.Buffer(Table.Column(Indexed, "Rth_Instant")),
+            RowCount = List.Count(RthList),
+
+            AddSS = Table.AddColumn(Indexed, "Is_SteadyState", each
+                let
+                    i     = [RowIdx],
+                    wStart = List.Max({0, i - SSWindow}),
+                    wEnd   = List.Min({RowCount - 1, i + SSWindow}),
+                    wLen   = wEnd - wStart + 1,
+                    Window = List.Range(RthList, wStart, wLen),
+                    Valid  = List.Select(Window, each _ <> null),
+                    StdDev = if List.Count(Valid) >= 5
+                             then List.StandardDeviation(Valid)
+                             else 999  // not enough data to tell
+                in  if StdDev < SSThresh then 1 else 0,
+                type number),
+
+            // =============================================
+            // PART F: Tag with test ID and pick final columns
+            // =============================================
+            AddTestID = Table.AddColumn(AddSS,
+                "Test_ID", each TestID, type text),
+
+            Final = Table.SelectColumns(AddTestID, {
+                "Test_ID", "Timestamp", "Elapsed_s", "BucketIndex",
+                "IN_WB_C", "OUT_WB_C", "DeltaT_C",
+                "IN_AHEX_C", "OUT_AHEX_C",
+                "CPU_Package_C", "CPU_Cores_Mean_C", "CPU_Cores_Min_C", "CPU_Cores_Max_C",
+                "N_Active_Cores", "CPU_Power_W",
+                "Rth_Instant", "Q_Instant_W", "Efficiency_Instant_Pct",
+                "Is_SteadyState", "Is_Throttling", "Is_PowerLimitExceeded",
+                "Sync_Offset_s", "Sync_Quality",
+                "Sensor_Flag", "CPU_Package_Match",
+                "P_AHEX_KPa", "P_005_WB_KPa",
+                "LV_RowCount"
+            })
+        in
+            Final
+    ),
+
+    // stack all the tests together
+    Combined = Table.Combine(ProcessedList),
+
+    TypedFinal = Table.TransformColumnTypes(Combined, {
+        {"Test_ID",                  type text},
+        {"Timestamp",                type datetime},
+        {"Elapsed_s",                type number},
+        {"BucketIndex",              Int64.Type},
+        {"IN_WB_C",              type number},
+        {"OUT_WB_C",             type number},
+        {"DeltaT_C",                type number},
+        {"IN_AHEX_C",           type number},
+        {"OUT_AHEX_C",          type number},
+        {"CPU_Package_C",           type number},
+        {"CPU_Cores_Mean_C",        type number},
+        {"CPU_Cores_Min_C",         type number},
+        {"CPU_Cores_Max_C",         type number},
+        {"N_Active_Cores",          Int64.Type},
+        {"CPU_Power_W",             type number},
+        {"Rth_Instant",             type number},
+        {"Q_Instant_W",             type number},
+        {"Efficiency_Instant_Pct",  type number},
+        {"Is_SteadyState",          type number},
+        {"Is_Throttling",           type logical},
+        {"Is_PowerLimitExceeded",   type logical},
+        {"Sync_Offset_s",           type number},
+        {"Sync_Quality",            type text},
+        {"Sensor_Flag",             type text},
+        {"CPU_Package_Match",       type text},
+        {"P_AHEX_KPa",               type number},
+        {"P_005_WB_KPa",             type number},
+        {"LV_RowCount",            Int64.Type}
+    })
+in
+    TypedFinal
